@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.30.3)
+project(lsplant)
+
+set(CMAKE_CXX_STANDARD 23)
+
+set(SOURCES lsplant.cc)
+file(GLOB_RECURSE MODULE_SOURCES CONFIGURE_DEPENDS "*.cxx")
+file(GLOB_RECURSE MODULE_INTERFACES CONFIGURE_DEPENDS "*.ixx")
+list(FILTER MODULE_SOURCES EXCLUDE REGEX "${CMAKE_CURRENT_SOURCE_DIR}.external.+")
+list(FILTER MODULE_INTERFACES EXCLUDE REGEX "${CMAKE_CURRENT_SOURCE_DIR}.external.+")
+
+set(DEX_BUILDER_BUILD_SHARED OFF CACHE INTERNAL "" FORCE)
+add_subdirectory(external/dex_builder)
+
+add_library(${PROJECT_NAME} STATIC ${SOURCES})
+set_target_properties(${PROJECT_NAME} PROPERTIES CXX_SCAN_FOR_MODULES ON)
+target_sources(${PROJECT_NAME} PRIVATE FILE_SET ms TYPE CXX_MODULES FILES ${MODULE_SOURCES})
+target_sources(${PROJECT_NAME} PUBLIC FILE_SET CXX_MODULES FILES ${MODULE_INTERFACES})
+target_include_directories(${PROJECT_NAME} PUBLIC include)
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(${PROJECT_NAME} PRIVATE dex_builder_static)
+target_link_libraries(${PROJECT_NAME} PUBLIC log)
