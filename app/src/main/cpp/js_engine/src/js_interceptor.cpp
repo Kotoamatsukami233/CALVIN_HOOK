@@ -77,6 +77,9 @@ extern "C" void dispatch_on_enter(void *ctx_raw) {
     auto *entry = *reinterpret_cast<AttachEntry **>(base + kOffEntry);
     if (!entry || JS_IsUndefined(entry->on_enter)) return;
 
+    LOGI("dispatch_on_enter: entry=%p, x0=%p",
+         entry, reinterpret_cast<void*>(*reinterpret_cast<uint64_t*>(base + kOffX0)));
+
     JSContext *ctx = entry->ctx;
     JSScope scope;
 
@@ -113,6 +116,9 @@ extern "C" void dispatch_on_leave(void *ctx_raw) {
     auto *base = static_cast<uint8_t *>(ctx_raw);
     auto *entry = *reinterpret_cast<AttachEntry **>(base + kOffEntry);
     if (!entry || JS_IsUndefined(entry->on_leave)) return;
+
+    LOGI("dispatch_on_leave: entry=%p, retval=%p",
+         entry, reinterpret_cast<void*>(*reinterpret_cast<uint64_t*>(base + kOffX0)));
 
     JSContext *ctx = entry->ctx;
     JSScope scope;
@@ -169,78 +175,125 @@ static bool generate_trampolines(AttachEntry *entry) {
         return false;
     }
 
+    // PAC-aware trampoline:
+    // Save LR in X19 (callee-saved) instead of the stack,
+    // so SP is unchanged when orig_func's PACIASP executes.
     arm64::Assembler a;
 
-    // 1. SUB SP, SP, #kSaveSize
+    // Flow:
+    //   STP X19, X30, [SP, #-16]!   ; save X19 and LR on stack (SP -= 16)
+    //   ... save all regs, dispatch_on_enter, restore ...
+    //   LDP X19, X30, [SP], #16     ; restore X19 and LR (SP += 16)
+    //   STP X19, X30, [SP, #-16]!   ; save X19 and LR again (SP -= 16)
+    //   MOV X19, LR                  ; save LR in X19
+    //   BLR orig_func                ; call orig (PACIASP sees correct SP)
+    //   MOV LR, X19                  ; restore LR from X19
+    //   STP X19, X30, [SP, #-16]!   ; save for dispatch_on_leave
+    //   ... save all regs, dispatch_on_leave, restore ...
+    //   LDP X19, X30, [SP], #16     ; restore
+    //   LDP X19, X30, [SP], #16     ; final restore + RET
+
+    // But simpler approach: use STP/LDP to save/restore X19+LR as a pair,
+    // keeping SP adjustments balanced around the orig_func call.
+
+    // === ON ENTER ===
+    // Save X19 and LR (callee-saved pair), SP -= 16
+    // STP X19, X30, [SP, #-16]! = 0xA9BF7BF3
+    emit(a, 0xA9BF7BF3u);
+
+    // Save all argument/temp regs + NEON on a separate stack frame
     emit(a, sub_sp(kSaveSize));
 
-    // 2. Store AttachEntry*
-    a.EmitMovImm64(16, reinterpret_cast<uintptr_t>(entry));
-    emit(a, str_x(16, 31, 0));
-
-    // 3. Save x0-x18
+    // Save x0-x18
     for (int i = 0; i < 19; i++)
         emit(a, str_x(i, 31, (kOffX0 + i * 8) / 8));
 
-    // 4. Save q0-q7
+    // Save q0-q7
     for (int i = 0; i < 8; i++)
         emit(a, str_q(i, 31, (kOffV0 + i * 16) / 16));
 
-    // 5. Call dispatch_on_enter(SP)
+    // Store AttachEntry*
+    a.EmitMovImm64(16, reinterpret_cast<uintptr_t>(entry));
+    emit(a, str_x(16, 31, 0));
+
+    // Call dispatch_on_enter(SP)
     a.EmitMovImm64(16, reinterpret_cast<uintptr_t>(&dispatch_on_enter));
-    emit(a, 0x910003E0u);  // ADD X0, SP, #0  (MOV X0, SP)
+    emit(a, 0x910003E0u);  // MOV X0, SP
     a.EmitBLR(16);
 
-    // 6. Restore x0-x18
+    // Restore x0-x18
     for (int i = 0; i < 19; i++)
         emit(a, ldr_x(i, 31, (kOffX0 + i * 8) / 8));
 
-    // 7. Restore q0-q7
+    // Restore q0-q7
     for (int i = 0; i < 8; i++)
         emit(a, ldr_q(i, 31, (kOffV0 + i * 16) / 16));
 
-    // 8. ADD SP, SP, #kSaveSize
     emit(a, add_sp(kSaveSize));
 
-    // 9. Save caller LR to stack
-    emit(a, sub_sp(16));
-    emit(a, str_x(30, 31, 1));  // STR LR, [SP, #8]
+    // === CALL ORIGINAL FUNCTION ===
+    // Restore X19/LR so SP is back to original, then re-save them
+    // so orig_func sees the correct SP for PACIASP.
+    // LDP X19, X30, [SP], #16  (SP += 16, back to caller SP)
+    emit(a, 0xA8C17BF3u);
 
-    // 10. Call orig_func (MOV X16, #0 placeholder; BLR X16)
+    // Now SP = caller SP. Save X19 and LR again.
+    // STP X19, X30, [SP, #-16]!
+    emit(a, 0xA9BF7BF3u);
+
+    // SP = caller SP - 16. This is what the caller would have done
+    // if it called open() normally (with BL setting LR and the caller
+    // having SP at caller_SP). Actually, the caller's SP is caller_SP.
+    // When open() does PACIASP, it uses SP = caller_SP - 16 (from our STP).
+    // When open() does STP X29,X30,[SP,#-16]!, SP = caller_SP - 32.
+    // When open() does LDP X29,X30,[SP],#16, SP = caller_SP - 16.
+    // When open() does AUTIASP, SP = caller_SP - 16. Matches PACIASP. OK!
+
+    // Save LR into X19 for safekeeping across orig_func call
+    // MOV X19, X30
+    emit(a, 0xAA1E03F3u);
+
+    // Call orig_func
     uint32_t patch_off = a.Buffer().CurrentOffset();
-    a.EmitMovImm64(16, 0);
+    a.EmitMovImm64(16, 0);  // placeholder
     a.EmitBLR(16);
     entry->orig_func_patch_offset = patch_off;
 
-    // 11. Save return regs (x0, x1, q0, q1) + entry*
-    emit(a, sub_sp(80));
-    a.EmitMovImm64(2, reinterpret_cast<uintptr_t>(entry));
-    emit(a, str_x(2, 31, 0));   // entry* at [SP, #0]
-    emit(a, str_x(0, 31, 1));   // x0 at [SP, #8]
-    emit(a, str_x(1, 31, 2));   // x1 at [SP, #16]
-    emit(a, str_q(0, 31, 3));   // q0 at [SP, #48]
-    emit(a, str_q(1, 31, 4));   // q1 at [SP, #64]
+    // Restore LR from X19 (orig_func may have clobbered LR via AUTIASP+RET)
+    // MOV X30, X19
+    emit(a, 0xAA1303FEu);
 
-    // 12. Call dispatch_on_leave
+    // === ON LEAVE ===
+    // Save all regs for dispatch_on_leave
+    emit(a, sub_sp(kSaveSize));
+
+    for (int i = 0; i < 19; i++)
+        emit(a, str_x(i, 31, (kOffX0 + i * 8) / 8));
+
+    for (int i = 0; i < 8; i++)
+        emit(a, str_q(i, 31, (kOffV0 + i * 16) / 16));
+
+    a.EmitMovImm64(16, reinterpret_cast<uintptr_t>(entry));
+    emit(a, str_x(16, 31, 0));
+
     a.EmitMovImm64(16, reinterpret_cast<uintptr_t>(&dispatch_on_leave));
-    emit(a, 0x910003E0u);  // ADD X0, SP, #0  (MOV X0, SP)
+    emit(a, 0x910003E0u);  // MOV X0, SP
     a.EmitBLR(16);
 
-    // 13. Restore return regs
-    emit(a, ldr_x(0, 31, 1));
-    emit(a, ldr_x(1, 31, 2));
-    emit(a, ldr_q(0, 31, 3));
-    emit(a, ldr_q(1, 31, 4));
+    for (int i = 0; i < 19; i++)
+        emit(a, ldr_x(i, 31, (kOffX0 + i * 8) / 8));
 
-    // 14. ADD SP, SP, #80
-    emit(a, add_sp(80));
+    for (int i = 0; i < 8; i++)
+        emit(a, ldr_q(i, 31, (kOffV0 + i * 16) / 16));
 
-    // 15. Restore LR
-    emit(a, ldr_x(30, 31, 1));
-    emit(a, add_sp(16));
+    emit(a, add_sp(kSaveSize));
 
-    // 16. RET
-    emit(a, 0xD65F0000u);
+    // Restore X19 and LR, return to caller
+    // LDP X19, X30, [SP], #16
+    emit(a, 0xA8C17BF3u);
+
+    // RET
+    emit(a, 0xD65F03C0u);  // RET X30
 
     a.Finalize();
 

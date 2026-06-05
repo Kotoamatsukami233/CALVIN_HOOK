@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
-
 // --- Helpers ---
 
 static void *get_arg_ptr(JSContext *ctx, JSValueConst val) {
@@ -96,13 +95,15 @@ static JSValue js_read_utf8(JSContext *ctx, JSValueConst, int argc, JSValueConst
     auto *p = get_arg_ptr(ctx, argv[0]);
     if (!p) return JS_EXCEPTION;
     int64_t size = -1;
-    if (argc >= 2) {
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
         if (JS_ToInt64(ctx, &size, argv[1]) < 0) return JS_EXCEPTION;
     }
+    // Copy to local buffer and create JS string
+    auto *cp = reinterpret_cast<const char *>(p);
     if (size < 0) {
-        return JS_NewString(ctx, reinterpret_cast<const char *>(p));
+        return JS_NewString(ctx, cp);
     }
-    return JS_NewStringLen(ctx, reinterpret_cast<const char *>(p), static_cast<size_t>(size));
+    return JS_NewStringLen(ctx, cp, static_cast<size_t>(size));
 }
 
 static JSValue js_read_byte_array(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {

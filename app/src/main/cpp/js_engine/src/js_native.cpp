@@ -185,7 +185,7 @@ static void marshal_and_call(
     a.EmitInst(0xA8C10000u | (22 << 10) | (31 << 5) | 21); // LDP x21, x22, [SP], #16
     a.EmitInst(0xA8C10000u | (20 << 10) | (31 << 5) | 19); // LDP x19, x20, [SP], #16
 
-    a.EmitInst(0xD65F0000u); // RET
+    a.EmitInst(0xD65F03C0u); // RET X30
 
     a.Finalize();
 

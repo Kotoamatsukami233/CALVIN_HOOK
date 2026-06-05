@@ -144,7 +144,14 @@ static jstring nativeLoadScript(JNIEnv *env, jclass, jstring jsource) {
 // ============================================================
 
 static jstring nativeTestOpen(JNIEnv *env, jobject) {
-    int fd = open("/proc/self/maps", O_RDONLY);
+    // Diagnostic: check if open() is hooked by reading its first instruction
+    using open_fn_t = int(*)(const char*, int, ...);
+    auto open_fn = (open_fn_t)dlsym(RTLD_DEFAULT, "open");
+    uint32_t first_inst = *reinterpret_cast<uint32_t *>(open_fn);
+    LOGI("nativeTestOpen: open=%p, first_inst=0x%08X", open_fn, first_inst);
+
+    int fd = open_fn("/proc/self/maps", O_RDONLY);
+    LOGI("nativeTestOpen: fd=%d", fd);
     if (fd >= 0) {
         close(fd);
         return env->NewStringUTF("open(\"/proc/self/maps\") -> fd closed");
@@ -244,18 +251,14 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
             if (!g_scriptEngineClass || !g_onNativeMessageMethod) return;
 
             JNIEnv *env = nullptr;
-            bool attached = false;
             if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
                 vm->AttachCurrentThread(&env, nullptr);
-                attached = true;
             }
             if (env) {
                 jstring jmsg = env->NewStringUTF(msg.c_str());
                 env->CallStaticVoidMethod(g_scriptEngineClass, g_onNativeMessageMethod, jmsg);
+                if (env->ExceptionCheck()) env->ExceptionClear();
                 env->DeleteLocalRef(jmsg);
-            }
-            if (attached) {
-                vm->DetachCurrentThread();
             }
         });
     }

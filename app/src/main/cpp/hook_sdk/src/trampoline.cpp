@@ -40,13 +40,13 @@ JumpPatch BuildJumpPatch(uintptr_t from, uintptr_t to) {
         return patch;
     }
 
-    // Strategy 3: LDR X17 + BR X17 + literal (20 bytes, arbitrary distance)
+    // Strategy 3: LDR X17 + BR X17 + literal (16 bytes, arbitrary distance)
     Assembler assem;
     assem.EmitLdrX17Branch(to);
     assem.Finalize();
     patch.code = std::move(assem.Buffer());
-    patch.patch_size = 20;
-    LOGD("JumpPatch: using LDR+BR+literal (20B)");
+    patch.patch_size = 16;
+    LOGD("JumpPatch: using LDR+BR+literal (16B)");
     return patch;
 }
 

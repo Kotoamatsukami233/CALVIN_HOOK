@@ -68,6 +68,15 @@ public class MainActivity extends AppCompatActivity {
             appendOutput("Result: " + result);
         });
 
+        // Auto-inject on startup for debugging
+        new Thread(() -> {
+            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            String script = etScript.getText().toString();
+            Log.i(TAG, "Auto-injecting script...");
+            String result = ScriptEngine.loadScript(script);
+            Log.i(TAG, "Auto-inject result: " + result);
+        }).start();
+
         btnTestOpen.setOnClickListener(v -> {
             appendOutput(">>> Calling open(\"/proc/self/maps\")...");
             String result = nativeTestOpen();

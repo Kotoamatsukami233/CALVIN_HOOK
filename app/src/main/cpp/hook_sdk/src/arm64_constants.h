@@ -77,7 +77,7 @@ constexpr uint32_t kValOpADRP    = 0x90000000;
 constexpr uint32_t kOpNOP        = 0xD503201F;
 constexpr uint32_t kOpBR         = 0xD61F0000;
 constexpr uint32_t kOpBLR        = 0xD63F0000;
-constexpr uint32_t kOpRET        = 0xD65F0000;
+constexpr uint32_t kOpRET        = 0xD65F03C0;  // RET X30 (LR)
 
 constexpr uint32_t kOpMovZ       = 0xD2800000;  // MOVZ Xd, #imm16, LSL #shift
 constexpr uint32_t kOpMovK       = 0xF2800000;  // MOVK Xd, #imm16, LSL #shift
