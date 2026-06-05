@@ -13,6 +13,8 @@
 #include <mutex>
 #include <vector>
 #include <atomic>
+#include <string>
+#include <cmath>
 
 #define LOG_TAG "JSSocket"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -43,6 +45,71 @@ static void broadcast_to_clients(const char *json) {
     }
 }
 
+// --- Base64 decoder ---
+static const char kB64Table[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string b64_decode(const std::string &in) {
+    int T[256];
+    memset(T, -1, sizeof(T));
+    for (int i = 0; i < 64; i++) T[(unsigned char)kB64Table[i]] = i;
+    T[(unsigned char)'='] = 0;
+
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    int val = 0, valb = -8;
+    for (unsigned char c : in) {
+        if (T[c] == -1) break;
+        val = (val << 6) | T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+// Extract JSON string value for a given key (simple, no nested quotes)
+static std::string json_get_string(const std::string &json, const char *key) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t ki = json.find(needle);
+    if (ki == std::string::npos) return "";
+    size_t colon = json.find(':', ki + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Escape a string for JSON output
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    out.push_back('"');
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out.push_back(c);
+                }
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
 // Handle a single client connection
 static void handle_client(int fd) {
     char buf[4096];
@@ -54,7 +121,6 @@ static void handle_client(int fd) {
         buf[n] = '\0';
         line += buf;
 
-        // Process complete lines (JSON messages)
         size_t pos;
         while ((pos = line.find('\n')) != std::string::npos) {
             std::string msg = line.substr(0, pos);
@@ -62,42 +128,27 @@ static void handle_client(int fd) {
 
             if (msg.empty()) continue;
 
-            // Parse as JSON and execute
             JSContext *ctx = JSEngine::GetContext();
             if (!ctx) continue;
 
-            JSScope scope;
-
-            // Check if message starts with {"type":"script"
-            // Simple protocol: each line is a JSON object with:
-            //   {"type":"script","action":"load","script":"<base64>","name":"..."}
-            // For simplicity, just evaluate the message as JS source
-
-            // Try to extract "script" field from JSON
             std::string script;
-            const char *script_key = strstr(msg.c_str(), "\"script\"");
-            if (script_key) {
-                const char *colon = strchr(script_key, ':');
-                if (colon) {
-                    colon++;
-                    while (*colon == ' ' || *colon == '"') colon++;
-                    const char *end = strchr(colon, '"');
-                    if (end) {
-                        // This is a simple extraction — real impl would use base64 decode
-                        script.assign(colon, end - colon);
-                    }
+
+            // Protocol: {"type":"script","data":"<base64>"}
+            if (msg.find("\"script\"") != std::string::npos) {
+                std::string b64 = json_get_string(msg, "data");
+                if (!b64.empty()) {
+                    script = b64_decode(b64);
                 }
             }
 
             if (script.empty()) {
-                // Treat the whole message as JS source
                 script = msg;
             }
 
+            JSScope scope;
             std::string result = JSEngine::LoadScript(script, "<socket>");
 
-            // Send result back
-            std::string response = "{\"type\":\"result\",\"value\":" + result + "}\n";
+            std::string response = "{\"type\":\"result\",\"value\":" + json_escape(result) + "}\n";
             send(fd, response.c_str(), response.size(), MSG_NOSIGNAL);
         }
     }
@@ -229,7 +280,43 @@ void js_socket_server_init(JSContext *ctx, JSValue ns) {
 }
 
 void js_socket_server_start() {
-    // Can be called from C to auto-start on a random port
+    if (g_running) return;
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        LOGE("Auto-start: socket() failed");
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(45896);
+
+    if (bind(server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        LOGE("Auto-start: bind() failed");
+        close(server_fd);
+        return;
+    }
+
+    if (listen(server_fd, 5) < 0) {
+        LOGE("Auto-start: listen() failed");
+        close(server_fd);
+        return;
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    getsockname(server_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len);
+    g_listen_port.store(ntohs(addr.sin_port));
+
+    g_running = true;
+    g_server_thread = std::thread(server_loop, server_fd);
+
+    LOGI("Socket server auto-started on port %d", g_listen_port.load());
 }
 
 void js_socket_server_stop() {

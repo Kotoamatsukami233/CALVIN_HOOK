@@ -7,6 +7,7 @@
 #include "elf_symbol_resolver.h"
 #include "lsplant.hpp"
 #include "js_engine.h"
+#include "js_socket_server.h"
 #include <android/log.h>
 
 #define LOG_TAG "HookDemo"
@@ -261,6 +262,9 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
                 env->DeleteLocalRef(jmsg);
             }
         });
+
+        // Auto-start socket server for remote script injection
+        js_socket_server_start();
     }
 
     // --- RegisterNatives for ScriptEngine ---

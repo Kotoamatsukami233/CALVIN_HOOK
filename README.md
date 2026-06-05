@@ -1,6 +1,6 @@
 # HOOK — ARM64 Inline Hook Framework + JavaScript Scripting Engine
 
-Android ARM64 inline hook 框架，内置 Java 方法 hook 和 QuickJS 脚本引擎，兼容 Frida 核心 API。
+Android ARM64 inline hook 框架，内置 Java 方法 hook 和 QuickJS 脚本引擎，兼容 Frida 核心 API，支持 TCP 远程脚本注入。
 
 ## 项目结构
 
@@ -31,7 +31,7 @@ app/src/main/
 │           ├── js_interceptor.h/cpp # Interceptor hook API
 │           ├── js_native.h/cpp      # NativeFunction/NativeCallback
 │           ├── js_java_bridge.h/cpp # Java.perform/Java.use
-│           ├── js_socket_server.h/cpp # TCP 脚本下发
+│           ├── js_socket_server.h/cpp # TCP 脚本下发 (port 45896)
 │           └── js_runtime.js        # ES2020 引导脚本
 ├── java/com/io/hook/
 │   ├── HookBridge.java     # Java hook 入口
@@ -40,6 +40,7 @@ app/src/main/
 │   ├── JavaHookManager.java    # 低层 hook 管理
 │   ├── ScriptEngine.java   # JS 引擎 JNI 桥接
 │   └── MainActivity.java   # 测试入口
+calvin.py                    # PC 端 Python 脚本发送工具
 ```
 
 ---
@@ -98,18 +99,10 @@ void remove_hook() {
 
 ### 技术细节
 
-- **跳转编码**：优先使用 4 字节 B 指令（±128MB），否则使用 LDR+BR 字面量（20 字节，任意距离）
+- **跳转编码**：优先 4 字节 B（±128MB）→ 12 字节 ADRP+ADD+BR（±4GB 页）→ 16 字节 LDR+BR（任意距离）
 - **指令重定位**：自动处理 B/BL/B.cond/CBZ/CBNZ/TBZ/TBNZ/ADR/ADRP/LDR literal 等指令
 - **近地址分配**：三级策略 — 已有页面空闲空间 → /proc/self/maps 间隙 → 已有区域 code cave
 - **线程安全**：使用 `mmap` + `mprotect` 管理可执行内存，代码写入期间临时切换权限
-
-### 实测结果
-
-| 测试 | 说明 | 结果 |
-|------|------|------|
-| 简单函数 hook | hook `get_secret_value()`，修改返回值 | PASS |
-| 16 参数函数 hook | hook `sum16_params(1..16)`，验证所有参数传递正确 | PASS |
-| Unhook 恢复 | unhook 后函数行为完全恢复 | PASS |
 
 ---
 
@@ -199,25 +192,20 @@ Method targetMethod = MainActivity.class.getMethod("computeValue", int.class, in
 MethodHook.Unhook unhook = HookBridge.hookMethod(targetMethod, new MethodHook() {
     @Override
     protected void before(HookParam param) {
-        // 修改参数：将 (10, 20) 改为 (100, 200)
         param.args[0] = 100;
         param.args[1] = 200;
     }
 
     @Override
     protected void after(HookParam param) {
-        // 覆盖返回值
         param.setResult(1000);
     }
 });
-
-// computeValue(10, 20) → before 修改参数 → 原方法执行 100+200=300 → after 覆盖为 1000
 
 unhook.unhook(); // 恢复
 
 // 2. 方法替换 — 直接返回固定值
 HookBridge.hookMethod(targetMethod, MethodReplacement.returnConstant(9999));
-// computeValue(任何参数) → 返回 9999，原方法不执行
 
 // 3. 调用原始方法
 Object result = HookBridge.invokeOriginalMethod(targetMethod, null, new Object[]{10, 20});
@@ -225,18 +213,8 @@ Object result = HookBridge.invokeOriginalMethod(targetMethod, null, new Object[]
 
 ### 反检测
 
-- LSPlant 生成的类名使用 proguard 风格的混淆名（`a0`, `a1`...），而非默认的 `LSPHooker_`
+- LSPlant 生成的类名使用 proguard 风格混淆名（`a0`, `a1`...），而非默认的 `LSPHooker_`
 - 通过 `RegisterNatives` 注册 native 方法，避免 `Java_com_io_hook_*` 符号模式
-
-### 实测结果
-
-| 测试 | 说明 | 结果 |
-|------|------|------|
-| before 修改参数 | args[0]=100, args[1]=200 | PASS |
-| after 覆盖返回值 | setResult(1000) | PASS |
-| 调用原方法 | invokeOriginalMethod 返回真实值 | PASS |
-| unhook 恢复 | 卸载后行为完全恢复 | PASS |
-| 方法替换 | returnConstant(9999) | PASS |
 
 ---
 
@@ -246,16 +224,38 @@ Object result = HookBridge.invokeOriginalMethod(targetMethod, null, new Object[]
 
 基于 QuickJS（Frida fork，ES2020）的脚本引擎，提供兼容 Frida 的 JavaScript API。支持通过 JS 脚本动态执行 native hook、内存读写、调用原生函数、hook Java 方法。
 
-### 引导方式
+### 远程脚本注入
 
-```java
-// Java 端执行 JS 脚本
-String result = ScriptEngine.loadScript("1 + 1");  // → "2"
+App 启动时自动开启 TCP Socket Server（端口 `45896`），可从 PC 端远程注入 JS 脚本：
 
-// 通过 TCP socket 远程下发脚本
-SocketServer.start(0);  // 随机端口
-SocketServer.send('{"type":"result","value":"..."}');
+```bash
+# 1. 端口转发（USB 连接时）
+adb forward tcp:45896 tcp:45896
+
+# 2. 使用 calvin.py 发送脚本（自动 base64 编码）
+python calvin.py hook_open.js
+
+# 3. 直接执行一行 JS
+python calvin.py -e 'send("hello")'
+
+# 4. 局域网直连（无需 adb）
+python calvin.py hook_open.js --host 192.168.1.100
 ```
+
+#### calvin.py 参数
+
+```
+python calvin.py <script.js>        # 发送 JS 文件
+python calvin.py -e 'code'          # 执行内联 JS
+python calvin.py script.js --host IP  # 指定目标 IP
+python calvin.py script.js --port PORT # 指定目标端口（默认 45896）
+```
+
+#### 协议
+
+- 客户端发送：`{"type":"script","data":"<base64>"}\n`
+- 服务端返回：`{"type":"result","value":"..."}\n`
+- 也支持直接发送原始 JS 文本（以 `\n` 结尾）
 
 ### JS API 参考
 
@@ -320,7 +320,8 @@ Memory.readU8(buf)              // → 0x41
 Memory.readU32(buf)             // → 12345
 Memory.readU64(buf)             // → 0xDEADBEEFCAFE (BigInt)
 Memory.readPointer(buf)         // → NativePointer(0x1234)
-Memory.readUtf8String(buf, 5)   // → "Hello"
+Memory.readUtf8String(buf)      // → "Hello"（自动到 \0）
+Memory.readUtf8String(buf, 5)   // → "Hello"（指定长度）
 Memory.readFloat(buf)           // → 3.14
 Memory.readDouble(buf)          // → 3.14159265
 Memory.readByteArray(buf, 4)   // → ArrayBuffer
@@ -337,33 +338,25 @@ Memory.readByteArray(buf, 4)   // → ArrayBuffer
 ```javascript
 // 查找导出函数地址
 var malloc = Module.findExportByName('libc.so', 'malloc');
-// malloc → NativePointer(0x7abc...)
-
 var open = Module.findExportByName(null, 'open');  // null = 搜索所有模块
 
 // 获取模块基地址
 var base = Module.getBaseAddress('libc.so');
-// base → NativePointer(0x7abc...)
 ```
 
 #### Interceptor
 
-Hook native 函数，支持 onEnter/onLeave 回调。
+Hook native 函数，支持 onEnter/onLeave 回调。完整保存/恢复 ARM64 寄存器状态（x0-x18, q0-q7），PAC 感知。
 
 ```javascript
 // attach：在目标函数前后插入回调
-var listener = Interceptor.attach(ptr(0x1234), {
+Interceptor.attach(Module.findExportByName('libc.so', 'open'), {
     onEnter: function(args) {
-        // args.x0 ~ args.x7 是前 8 个参数的指针表示
-        console.log("arg0 =", args.x0);
-        // 可以修改参数：
-        // args.x0 = ptr(0x9999);
+        // args.x0 ~ args.x7 是前 8 个参数
+        send("open: " + Memory.readUtf8String(args.x0));
     },
     onLeave: function(retval) {
-        // retval 是返回值的指针表示
-        console.log("return =", retval);
-        // 可以修改返回值：
-        // retval.replace(ptr(42));
+        send("  -> fd = " + retval.toInt32());
     }
 });
 
@@ -386,23 +379,17 @@ Interceptor.detachAll();
 // 类型: void/int/uint8/int8/uint16/int16/uint32/int32/uint64/int64
 //       float/double/pointer/size_t
 
-// 调用 libc 的 open 函数
 var open = new NativeFunction(
     Module.findExportByName(null, 'open'),
     'int', ['pointer', 'int']
 );
 var fd = open(ptr("/proc/self/maps"), 0);
 
-// 调用 malloc
 var malloc = new NativeFunction(
     Module.findExportByName(null, 'malloc'),
     'pointer', ['int']
 );
 var mem = malloc(1024);
-
-// 调用自定义函数
-var myFunc = new NativeFunction(ptr(0x1234), 'int', ['int', 'int', 'int']);
-var result = myFunc(1, 2, 3);  // 直接调用
 ```
 
 #### NativeCallback
@@ -410,19 +397,12 @@ var result = myFunc(1, 2, 3);  // 直接调用
 将 JS 函数转换为原生函数指针，供 native 代码回调。
 
 ```javascript
-// new NativeCallback(jsFunc, returnType, [argTypes])
-
 var callback = new NativeCallback(
-    function(a, b) {
-        return a + b;
-    },
+    function(a, b) { return a + b; },
     'int', ['int', 'int']
 );
 
-// callback.address 是一个 NativePointer，可传给任何需要函数指针的地方
-var result_ptr = callback.address;  // 可传给 HookInstall 等
-
-// 用作 Interceptor.replace 的替换函数
+// callback.address 是 NativePointer，可传给任何需要函数指针的地方
 Interceptor.replace(target, new NativeCallback(
     function() { return 42; },
     'int', []
@@ -434,31 +414,17 @@ Interceptor.replace(target, new NativeCallback(
 在 JS 中调用 JNI 操作，hook Java 方法。
 
 ```javascript
-// Java.perform：在 JNI 线程中执行代码
 Java.perform(function() {
-    // JNI 环境已 attach
-    var Foo = Java.use("com.example.Foo");
-    // ...
+    var Activity = Java.use("com.io.hook.MainActivity");
 });
-
-// Java.use：获取 Java 类的包装器
-var Activity = Java.use("com.io.hook.MainActivity");
 ```
 
-#### send / SocketServer
+#### send
 
-脚本与外部的消息通信。
+发送消息到 logcat 和所有已连接的 TCP 客户端。
 
 ```javascript
-// 发送 JSON 消息到所有连接的客户端
-send(JSON.stringify({ type: "log", message: "hook installed" }));
-
-// TCP 服务器控制
-SocketServer.start(0);       // 启动，0 = 随机端口
-SocketServer.start(27042);   // 启动，指定端口
-SocketServer.stop();         // 停止
-SocketServer.getPort();      // 获取当前端口
-SocketServer.send(json);     // 广播消息到所有客户端
+send("hook installed on open @ " + openPtr);
 ```
 
 ### 线程安全
@@ -470,18 +436,24 @@ SocketServer.send(json);     // 广播消息到所有客户端
 - 如果 JS 线程正在执行，hook 回调会阻塞等待
 - NativeCallback 的 native → JS 调用同样通过 JSScope 保护
 
-### 反检测
+---
 
-- `-fvisibility=hidden`：所有 js_engine 符号不导出
-- QuickJS 版本字符串改为 `"6.0.0"`（不暴露 QuickJS 标识）
-- JS 运行时脚本不包含 "Frida" 字符串
-- Log tag 使用通用名称 `"Core"`
-- HookBridge native 方法通过 `RegisterNatives` 注册（无 `Java_com_io_hook_*` 符号）
-- LSPlant 生成类名使用 proguard 风格混淆
+## 四、反检测
+
+| 措施 | 说明 |
+|------|------|
+| LSPlant 类名混淆 | 生成类名 `a0`, `a1`... 替代 `LSPHooker_` |
+| RegisterNatives | 避免 `Java_com_io_hook_*` JNI 符号模式 |
+| 符号隐藏 | `-fvisibility=hidden`，js_engine 符号不导出 |
+| QuickJS 版本伪装 | 版本字符串改为 `"6.0.0"` |
+| XOR 字符串混淆 | QuickJS 关键标识使用运行时解密 |
+| 无特征字符串 | JS 运行时脚本不包含 "Frida" 等标识 |
 
 ---
 
-## 四、构建
+## 五、构建与使用
+
+### 构建
 
 ```bash
 # 编译 debug APK
@@ -492,6 +464,19 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 # 启动
 adb shell am start -n com.io.hook/.MainActivity
+```
+
+### 远程注入
+
+```bash
+# 端口转发
+adb forward tcp:45896 tcp:45896
+
+# 发送 JS 脚本
+python calvin.py hook_open.js
+
+# 执行一行 JS
+python calvin.py -e 'send("test")'
 ```
 
 ### 依赖
@@ -509,7 +494,7 @@ adb shell am start -n com.io.hook/.MainActivity
 
 ---
 
-## 五、实测结果汇总
+## 六、实测结果汇总
 
 所有测试在 Android 16 (Pixel 8 Pro) 上通过：
 
@@ -527,10 +512,14 @@ adb shell am start -n com.io.hook/.MainActivity
 | 4e | Module.findExportByName | PASS |
 | 4f | NativeFunction 创建 | PASS |
 | 4g | JS 错误处理 | PASS |
+| 5a | Interceptor.attach (onEnter/onLeave) | PASS |
+| 5b | Memory.readUtf8String | PASS |
+| 5c | TCP Socket Server 远程注入 | PASS |
+| 5d | calvin.py base64 脚本发送 | PASS |
 
 ---
 
-## 六、技术架构
+## 七、技术架构
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -557,3 +546,15 @@ adb shell am start -n com.io.hook/.MainActivity
 │              libart.so · JNI · mmap               │
 └─────────────────────────────────────────────────┘
 ```
+
+---
+
+## 八、待完成功能
+
+| 功能 | 说明 | 优先级 |
+|------|------|--------|
+| Java.invokeOriginal | JS 端调用原始 Java 方法 | 高 |
+| Interceptor.detach(id) | 单个 hook 卸载（当前仅 detachAll） | 中 |
+| Module.enumerateExports | 枚举模块导出符号 | 中 |
+| Memory.scan | 内存模式扫描 | 中 |
+| Process API | id/arch/enumerateModules 等 | 低 |
